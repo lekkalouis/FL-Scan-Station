@@ -510,7 +510,8 @@ app.post("/shopify/fulfill", async (req, res) => {
     if (!fulfillmentOrders.length) {
       return res.status(409).json({
         error: "NO_FULFILLMENT_ORDERS",
-        message: "No fulfillment_orders found for this order (cannot fulfill)",
+        message:
+          "No fulfillment_orders found for this order. Ensure the order has fulfillment orders created/assigned before fulfilling.",
         body: foData
       });
     }
