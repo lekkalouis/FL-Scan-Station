@@ -89,11 +89,12 @@ function badRequest(res, message, detail) {
   return res.status(400).json({ error: "BAD_REQUEST", message, detail });
 }
 
-function buildPlaceQuery(order) {
+function buildPlaceQueries(order) {
   const s = order?.shipping_address || {};
-  return [s.address1, s.city, s.province, s.zip, s.country]
-    .filter(Boolean)
-    .join(" ");
+  return {
+    city: (s.city || "").trim(),
+    postcode: (s.zip || "").trim()
+  };
 }
 
 function getPlaceCache(key) {
@@ -586,16 +587,16 @@ app.post("/pp/resolve-place", async (req, res) => {
     const { order, customerPlaceCode } = req.body || {};
     if (!order) return res.status(400).json({ error: "MISSING_ORDER" });
 
-    const query = buildPlaceQuery(order);
-    const cacheKey = `${query.toLowerCase()}|${String(customerPlaceCode || "")}`;
+    const { city, postcode } = buildPlaceQueries(order);
+    const cacheKey = `${city.toLowerCase()}|${postcode}|${String(customerPlaceCode || "")}`;
     const cached = getPlaceCache(cacheKey);
     if (cached) return res.json(cached);
 
     let ppError = null;
 
-    if (query) {
+    if (city) {
       try {
-        const byName = await callParcelPerfect("getPlacesByName", "quote", { name: query });
+        const byName = await callParcelPerfect("getPlacesByName", "quote", { name: city });
         const hit = Array.isArray(byName?.results) ? byName.results[0] : null;
         const placeCode = hit?.placecode ?? hit?.place ?? null;
         if (placeCode != null) {
@@ -608,7 +609,6 @@ app.post("/pp/resolve-place", async (req, res) => {
       }
     }
 
-    const postcode = order?.shipping_address?.zip;
     if (postcode) {
       try {
         const byPostcode = await callParcelPerfect("getPlacesByPostcode", "quote", { postcode });
