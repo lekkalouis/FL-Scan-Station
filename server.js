@@ -89,12 +89,11 @@ function badRequest(res, message, detail) {
   return res.status(400).json({ error: "BAD_REQUEST", message, detail });
 }
 
-function buildPlaceQueries(order) {
+function buildPlaceQuery(order) {
   const s = order?.shipping_address || {};
-  return {
-    city: (s.city || "").trim(),
-    postcode: (s.zip || "").trim()
-  };
+  return [s.address1, s.city, s.province, s.zip, s.country]
+    .filter(Boolean)
+    .join(" ");
 }
 
 function getPlaceCache(key) {
@@ -113,46 +112,6 @@ function setPlaceCache(key, value) {
     if (oldestKey) placeResolveCache.delete(oldestKey);
   }
   placeResolveCache.set(key, { value, expiresAt: Date.now() + PLACE_CACHE_TTL_MS });
-}
-
-async function callParcelPerfect(method, classVal, params) {
-  if (!PP_BASE_URL || !PP_BASE_URL.startsWith("http")) {
-    throw new Error("PP_BASE_URL is not a valid URL");
-  }
-
-  if (!PP_TOKEN) {
-    throw new Error("PP_TOKEN is required for ParcelPerfect calls");
-  }
-
-  const form = new URLSearchParams();
-  form.set("method", String(method));
-  form.set("class", String(classVal));
-  form.set("params", JSON.stringify(params || {}));
-  form.set("token_id", PP_TOKEN);
-
-  const upstream = await fetch(PP_BASE_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: form.toString()
-  });
-
-  const text = await upstream.text();
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch (e) {
-    throw new Error(`PP_NON_JSON_RESPONSE: ${text.slice(0, 200)}`);
-  }
-
-  if (!upstream.ok) {
-    throw new Error(`PP_HTTP_${upstream.status}`);
-  }
-
-  if (data?.errorcode && Number(data.errorcode) !== 0) {
-    throw new Error(`PP_ERROR_${data.errorcode}`);
-  }
-
-  return data;
 }
 
 function requireShopifyConfigured(res) {
@@ -588,50 +547,62 @@ app.post("/pp/resolve-place", async (req, res) => {
     const { order, customerPlaceCode } = req.body || {};
     if (!order) return res.status(400).json({ error: "MISSING_ORDER" });
 
-    const { city, postcode } = buildPlaceQueries(order);
-    const cacheKey = `${city.toLowerCase()}|${postcode}|${String(customerPlaceCode || "")}`;
+    const query = buildPlaceQuery(order);
+    const cacheKey = `${query.toLowerCase()}|${String(customerPlaceCode || "")}`;
     const cached = getPlaceCache(cacheKey);
     if (cached) return res.json(cached);
 
-    let ppError = null;
-
-    if (city) {
-      try {
-        const byName = await callParcelPerfect("getPlacesByName", "quote", { name: city });
-        const hit = Array.isArray(byName?.results) ? byName.results[0] : null;
-        const placeCode = hit?.placecode ?? hit?.place ?? null;
-        if (placeCode != null) {
-          const payload = { source: "pp", placeCode, hit };
-          setPlaceCache(cacheKey, payload);
-          return res.json(payload);
-        }
-      } catch (e) {
-        ppError = String(e?.message || e);
-      }
+    if (!PP_BASE_URL || !PP_BASE_URL.startsWith("http")) {
+      return res.status(500).json({
+        error: "CONFIG_ERROR",
+        message: "PP_BASE_URL is not a valid URL"
+      });
     }
 
-    if (postcode) {
-      try {
-        const byPostcode = await callParcelPerfect("getPlacesByPostcode", "quote", { postcode });
-        const hit = Array.isArray(byPostcode?.results) ? byPostcode.results[0] : null;
-        const placeCode = hit?.placecode ?? hit?.place ?? null;
-        if (placeCode != null) {
-          const payload = { source: "pp", placeCode, hit };
-          setPlaceCache(cacheKey, payload);
-          return res.json(payload);
-        }
-      } catch (e) {
-        ppError = String(e?.message || e);
+    if (!PP_TOKEN) {
+      return res.status(500).json({
+        error: "CONFIG_ERROR",
+        message: "PP_TOKEN is required for getPlace"
+      });
+    }
+
+    if (query) {
+      const paramsObj = {
+        id: PP_PLACE_ID || "ShopifyScanStation",
+        accnum: PP_ACCNUM || "",
+        ppcust: ""
+      };
+
+      const qs = new URLSearchParams();
+      qs.set("Class", "Waybill");
+      qs.set("method", "getPlace");
+      qs.set("token_id", PP_TOKEN);
+      qs.set("params", JSON.stringify(paramsObj));
+      qs.set("query", query);
+
+      const base = PP_BASE_URL.endsWith("/") ? PP_BASE_URL : PP_BASE_URL + "/";
+      const url = `${base}?${qs.toString()}`;
+
+      const upstream = await fetch(url, { method: "GET" });
+      const text = await upstream.text();
+      const data = JSON.parse(text);
+
+      const hit = Array.isArray(data?.results) ? data.results[0] : null;
+      const placeCode = hit?.placecode ?? hit?.place ?? null;
+      if (placeCode != null) {
+        const payload = { source: "pp", placeCode, hit };
+        setPlaceCache(cacheKey, payload);
+        return res.json(payload);
       }
     }
 
     if (customerPlaceCode) {
-      const payload = { source: "customer_metafield", placeCode: customerPlaceCode, ppError };
+      const payload = { source: "customer_metafield", placeCode: customerPlaceCode };
       setPlaceCache(cacheKey, payload);
       return res.json(payload);
     }
 
-    const payload = { source: "none", placeCode: null, ppError };
+    const payload = { source: "none", placeCode: null };
     setPlaceCache(cacheKey, payload);
     return res.json(payload);
   } catch (err) {
