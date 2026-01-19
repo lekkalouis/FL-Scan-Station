@@ -81,8 +81,78 @@ app.use(
 app.use(morgan(NODE_ENV === "production" ? "combined" : "dev"));
 
 // ===== Helpers =====
+const placeResolveCache = new Map();
+const PLACE_CACHE_TTL_MS = 10 * 60 * 1000;
+const PLACE_CACHE_MAX = 500;
+
 function badRequest(res, message, detail) {
   return res.status(400).json({ error: "BAD_REQUEST", message, detail });
+}
+
+function buildPlaceQueries(order) {
+  const s = order?.shipping_address || {};
+  return {
+    city: (s.city || "").trim(),
+    postcode: (s.zip || "").trim()
+  };
+}
+
+function getPlaceCache(key) {
+  const entry = placeResolveCache.get(key);
+  if (!entry) return null;
+  if (entry.expiresAt <= Date.now()) {
+    placeResolveCache.delete(key);
+    return null;
+  }
+  return entry.value;
+}
+
+function setPlaceCache(key, value) {
+  if (placeResolveCache.size >= PLACE_CACHE_MAX) {
+    const oldestKey = placeResolveCache.keys().next().value;
+    if (oldestKey) placeResolveCache.delete(oldestKey);
+  }
+  placeResolveCache.set(key, { value, expiresAt: Date.now() + PLACE_CACHE_TTL_MS });
+}
+
+async function callParcelPerfect(method, classVal, params) {
+  if (!PP_BASE_URL || !PP_BASE_URL.startsWith("http")) {
+    throw new Error("PP_BASE_URL is not a valid URL");
+  }
+
+  if (!PP_TOKEN) {
+    throw new Error("PP_TOKEN is required for ParcelPerfect calls");
+  }
+
+  const form = new URLSearchParams();
+  form.set("method", String(method));
+  form.set("class", String(classVal));
+  form.set("params", JSON.stringify(params || {}));
+  form.set("token_id", PP_TOKEN);
+
+  const upstream = await fetch(PP_BASE_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: form.toString()
+  });
+
+  const text = await upstream.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch (e) {
+    throw new Error(`PP_NON_JSON_RESPONSE: ${text.slice(0, 200)}`);
+  }
+
+  if (!upstream.ok) {
+    throw new Error(`PP_HTTP_${upstream.status}`);
+  }
+
+  if (data?.errorcode && Number(data.errorcode) !== 0) {
+    throw new Error(`PP_ERROR_${data.errorcode}`);
+  }
+
+  return data;
 }
 
 function requireShopifyConfigured(res) {
@@ -408,23 +478,63 @@ app.post("/shopify/fulfill", async (req, res) => {
       });
     }
 
-    const fulfillmentOrders = Array.isArray(foData.fulfillment_orders)
+    let fulfillmentOrders = Array.isArray(foData.fulfillment_orders)
       ? foData.fulfillment_orders
       : [];
 
     if (!fulfillmentOrders.length) {
+      const fallbackUrl = `${base}/fulfillment_orders.json?order_id=${orderId}`;
+      const fallbackResp = await shopifyFetch(fallbackUrl, { method: "GET" });
+      const fallbackText = await fallbackResp.text();
+      let fallbackData;
+      try {
+        fallbackData = JSON.parse(fallbackText);
+      } catch {
+        fallbackData = { raw: fallbackText };
+      }
+
+      if (fallbackResp.ok) {
+        fulfillmentOrders = Array.isArray(fallbackData.fulfillment_orders)
+          ? fallbackData.fulfillment_orders
+          : [];
+      } else {
+        return res.status(fallbackResp.status).json({
+          error: "SHOPIFY_UPSTREAM",
+          status: fallbackResp.status,
+          statusText: fallbackResp.statusText,
+          body: fallbackData
+        });
+      }
+    }
+
+    if (!fulfillmentOrders.length) {
       return res.status(409).json({
         error: "NO_FULFILLMENT_ORDERS",
-        message: "No fulfillment_orders found for this order (cannot fulfill)",
+        message:
+          "No fulfillment_orders found for this order. Ensure the order has fulfillment orders created/assigned before fulfilling.",
         body: foData
       });
     }
 
-    const fo =
-      fulfillmentOrders.find((f) => f.status !== "closed" && f.status !== "cancelled") ||
-      fulfillmentOrders[0];
+    if (fulfillmentOrders.every((f) => f.status === "closed")) {
+      return res.status(409).json({
+        error: "ORDER_ALREADY_FULFILLED",
+        message: "All fulfillment orders are closed"
+      });
+    }
 
-    const fulfillment_order_id = fo.id;
+    const line_items_by_fulfillment_order = fulfillmentOrders
+      .filter((fo) => fo.status !== "closed" && fo.status !== "cancelled")
+      .map((fo) => ({
+        fulfillment_order_id: fo.id,
+        fulfillment_order_line_items: (fo.line_items || [])
+          .filter((li) => li.remaining_quantity > 0)
+          .map((li) => ({
+            id: li.id,
+            quantity: li.remaining_quantity
+          }))
+      }))
+      .filter((entry) => entry.fulfillment_order_line_items.length > 0);
 
     const fulfillUrl = `${base}/fulfillments.json`;
     const fulfillmentPayload = {
@@ -436,7 +546,7 @@ app.post("/shopify/fulfill", async (req, res) => {
           url: trackingUrl || undefined,
           company: trackingCompanyFinal
         },
-        line_items_by_fulfillment_order: [{ fulfillment_order_id }]
+        line_items_by_fulfillment_order
       }
     };
 
@@ -467,6 +577,67 @@ app.post("/shopify/fulfill", async (req, res) => {
     console.error("Shopify fulfill error:", err);
     return res.status(502).json({
       error: "UPSTREAM_ERROR",
+      message: String(err?.message || err)
+    });
+  }
+});
+
+// ===== ParcelPerfect: resolve place code (PP search -> customer metafield -> none) =====
+app.post("/pp/resolve-place", async (req, res) => {
+  try {
+    const { order, customerPlaceCode } = req.body || {};
+    if (!order) return res.status(400).json({ error: "MISSING_ORDER" });
+
+    const { city, postcode } = buildPlaceQueries(order);
+    const cacheKey = `${city.toLowerCase()}|${postcode}|${String(customerPlaceCode || "")}`;
+    const cached = getPlaceCache(cacheKey);
+    if (cached) return res.json(cached);
+
+    let ppError = null;
+
+    if (city) {
+      try {
+        const byName = await callParcelPerfect("getPlacesByName", "quote", { name: city });
+        const hit = Array.isArray(byName?.results) ? byName.results[0] : null;
+        const placeCode = hit?.placecode ?? hit?.place ?? null;
+        if (placeCode != null) {
+          const payload = { source: "pp", placeCode, hit };
+          setPlaceCache(cacheKey, payload);
+          return res.json(payload);
+        }
+      } catch (e) {
+        ppError = String(e?.message || e);
+      }
+    }
+
+    if (postcode) {
+      try {
+        const byPostcode = await callParcelPerfect("getPlacesByPostcode", "quote", { postcode });
+        const hit = Array.isArray(byPostcode?.results) ? byPostcode.results[0] : null;
+        const placeCode = hit?.placecode ?? hit?.place ?? null;
+        if (placeCode != null) {
+          const payload = { source: "pp", placeCode, hit };
+          setPlaceCache(cacheKey, payload);
+          return res.json(payload);
+        }
+      } catch (e) {
+        ppError = String(e?.message || e);
+      }
+    }
+
+    if (customerPlaceCode) {
+      const payload = { source: "customer_metafield", placeCode: customerPlaceCode, ppError };
+      setPlaceCache(cacheKey, payload);
+      return res.json(payload);
+    }
+
+    const payload = { source: "none", placeCode: null, ppError };
+    setPlaceCache(cacheKey, payload);
+    return res.json(payload);
+  } catch (err) {
+    console.error("PP resolve-place error:", err);
+    return res.status(502).json({
+      error: "PP_LOOKUP_FAILED",
       message: String(err?.message || err)
     });
   }
