@@ -437,14 +437,40 @@ app.post("/shopify/fulfill", async (req, res) => {
       });
     }
 
-    const fulfillmentOrders = Array.isArray(foData.fulfillment_orders)
+    let fulfillmentOrders = Array.isArray(foData.fulfillment_orders)
       ? foData.fulfillment_orders
       : [];
 
     if (!fulfillmentOrders.length) {
+      const fallbackUrl = `${base}/fulfillment_orders.json?order_id=${orderId}`;
+      const fallbackResp = await shopifyFetch(fallbackUrl, { method: "GET" });
+      const fallbackText = await fallbackResp.text();
+      let fallbackData;
+      try {
+        fallbackData = JSON.parse(fallbackText);
+      } catch {
+        fallbackData = { raw: fallbackText };
+      }
+
+      if (fallbackResp.ok) {
+        fulfillmentOrders = Array.isArray(fallbackData.fulfillment_orders)
+          ? fallbackData.fulfillment_orders
+          : [];
+      } else {
+        return res.status(fallbackResp.status).json({
+          error: "SHOPIFY_UPSTREAM",
+          status: fallbackResp.status,
+          statusText: fallbackResp.statusText,
+          body: fallbackData
+        });
+      }
+    }
+
+    if (!fulfillmentOrders.length) {
       return res.status(409).json({
         error: "NO_FULFILLMENT_ORDERS",
-        message: "No fulfillment_orders found for this order (cannot fulfill)",
+        message:
+          "No fulfillment_orders found for this order. Ensure the order has fulfillment orders created/assigned before fulfilling.",
         body: foData
       });
     }
