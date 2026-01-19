@@ -38,6 +38,7 @@
   const debugLog = $("debugLog");
   const quoteBox = $("quoteBox");
   const printMount = $("printMount");
+  const addrBox = $("addrBox");
   const addrSearch = $("addrSearch");
   const addrResults = $("addrResults");
   const placeCodeInput = $("placeCode");
@@ -332,6 +333,7 @@ function scheduleIdleAutoBook() {
     placeCodeInput?.addEventListener("input", () => {
       const v = (placeCodeInput.value || "").trim();
       placeCodeOverride = v ? Number(v) || null : null;
+      if (placeCodeInput) placeCodeInput.dataset.source = v ? "manual" : "";
     });
     serviceSelect?.addEventListener("change", () => {
       serviceOverride = serviceSelect.value || "AUTO";
@@ -436,6 +438,7 @@ Email: ${orderDetails.email || ""}`.trim();
     };
     placeCodeOverride = entry.placeCode || null;
     if (placeCodeInput) placeCodeInput.value = placeCodeOverride ? String(placeCodeOverride) : "";
+    if (placeCodeInput) placeCodeInput.dataset.source = "address_book";
     renderSessionUI();
   }
 
@@ -543,74 +546,14 @@ admin@flippenlekkaspices.co.za`.replace(/\n/g, "<br>");
     }
   }
 
-  function resolvePlaceCode(dest) {
-    const key = `${(dest.city || "").trim().toLowerCase()}|${(dest.postal || "").trim()}`;
-    const table = {
-      "cape town|7530": 4001,
-      "bellville|7530": 4001,
-      "durbanville|7550": 4020,
-      "cape town|8001": 3001
-    };
-    return table[key] || null;
-  }
-
-  async function lookupPlaceCodeFromPP(destDetails) {
-    const suburb = (destDetails.suburb || destDetails.address2 || "").trim();
-    const town = (destDetails.city || "").trim();
-
-    const queries = [];
-    if (suburb) queries.push(suburb);
-    if (town && town.toLowerCase() !== suburb.toLowerCase()) {
-      queries.push(town);
-      if (suburb) queries.push(`${suburb} ${town}`);
-    }
-
-    if (!queries.length) return null;
-
-    for (const q of queries) {
-      try {
-        appendDebug("PP getPlace query: " + q);
-        const res = await fetch(`/pp/place?q=${encodeURIComponent(q)}`);
-        if (!res.ok) throw new Error("HTTP " + res.status);
-        const data = await res.json();
-
-        if (data.errorcode && Number(data.errorcode) !== 0) continue;
-
-        const list = Array.isArray(data.results) ? data.results : [];
-        if (!list.length) continue;
-
-        const targetTown = town.toLowerCase();
-        const targetSuburb = suburb.toLowerCase();
-
-        let best =
-          (targetSuburb &&
-            list.find((p) => {
-              const name = (p.name || "").toLowerCase();
-              const t = (p.town || "").toLowerCase();
-              return ((name.includes(targetSuburb) || t.includes(targetSuburb)) && String(p.ring) === "0");
-            })) ||
-          (targetSuburb &&
-            list.find((p) => {
-              const name = (p.name || "").toLowerCase();
-              const t = (p.town || "").toLowerCase();
-              return name.includes(targetSuburb) || t.includes(targetSuburb);
-            })) ||
-          (targetTown &&
-            list.find((p) => (p.town || "").trim().toLowerCase() === targetTown && String(p.ring) === "0")) ||
-          (targetTown && list.find((p) => (p.town || "").trim().toLowerCase() === targetTown)) ||
-          list.find((p) => String(p.ring) === "0") ||
-          list[0];
-
-        if (!best || best.place == null) continue;
-
-        const code = Number(best.place);
-        const label = (best.name || "").trim() + (best.town ? " – " + String(best.town).trim() : "");
-        return { code, label, raw: best };
-      } catch (e) {
-        appendDebug("PP getPlace failed: " + String(e));
-      }
-    }
-    return null;
+  async function resolvePlaceCode(order, customerPlaceCode) {
+    const res = await fetch("/pp/resolve-place", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ order, customerPlaceCode })
+    });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    return res.json();
   }
 
   function buildParcelPerfectPayload(destDetails, parcelCount) {
@@ -621,7 +564,7 @@ admin@flippenlekkaspices.co.za`.replace(/\n/g, "<br>");
         ? placeCodeOverride
         : destDetails && destDetails.placeCode != null
         ? Number(destDetails.placeCode) || destDetails.placeCode
-        : resolvePlaceCode(destDetails) || null;
+        : null;
 
     let perParcelMass = CONFIG.BOX_DIM.massKg;
     if (destDetails && typeof destDetails.totalWeightKg === "number" && destDetails.totalWeightKg > 0 && parcelCount > 0) {
@@ -907,6 +850,8 @@ function resetSession() {
 
   placeCodeOverride = null;
   if (placeCodeInput) placeCodeInput.value = "";
+  if (placeCodeInput) placeCodeInput.dataset.source = "";
+  if (addrBox) addrBox.hidden = true;
 
   renderSessionUI();
   renderCountdown();
@@ -931,12 +876,17 @@ async function startOrder(orderNo) {
 
   placeCodeOverride = null;
   if (placeCodeInput) placeCodeInput.value = "";
+  if (placeCodeInput) placeCodeInput.dataset.source = "";
+  if (addrBox) addrBox.hidden = true;
 
   orderDetails = await fetchShopifyOrder(activeOrderNo);
 
   if (orderDetails && orderDetails.placeCode != null) {
     placeCodeOverride = Number(orderDetails.placeCode) || orderDetails.placeCode;
     if (placeCodeInput) placeCodeInput.value = String(placeCodeOverride);
+    if (placeCodeInput) placeCodeInput.dataset.source = orderDetails.placeSource || "";
+  } else if (addrBox) {
+    addrBox.hidden = false;
   }
 
   appendDebug("Started new order " + activeOrderNo);
@@ -1044,16 +994,22 @@ async function handleScan(code) {
         totalWeightKg,
         placeCode: placeCodeFromMeta,
         placeLabel: null,
+        placeSource: null,
         parcelCountFromTag,
         manualParcelCount: null
       };
 
-      if (!placeCodeFromMeta) {
-        const lookedUp = await lookupPlaceCodeFromPP(normalized);
-        if (lookedUp?.code != null) {
-          normalized.placeCode = lookedUp.code;
-          normalized.placeLabel = lookedUp.label;
+      try {
+        const resolved = await resolvePlaceCode(o, placeCodeFromMeta);
+        if (resolved?.placeCode != null) {
+          normalized.placeCode = resolved.placeCode;
+          normalized.placeSource = resolved.source || null;
+          if (resolved.hit?.name) {
+            normalized.placeLabel = resolved.hit.name;
+          }
         }
+      } catch (e) {
+        appendDebug("Place resolve failed: " + String(e));
       }
 
       return normalized;
@@ -1074,6 +1030,7 @@ async function handleScan(code) {
         totalWeightKg: CONFIG.BOX_DIM.massKg,
         placeCode: null,
         placeLabel: null,
+        placeSource: null,
         parcelCountFromTag: null,
         manualParcelCount: null
       };

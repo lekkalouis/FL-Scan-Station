@@ -81,8 +81,37 @@ app.use(
 app.use(morgan(NODE_ENV === "production" ? "combined" : "dev"));
 
 // ===== Helpers =====
+const placeResolveCache = new Map();
+const PLACE_CACHE_TTL_MS = 10 * 60 * 1000;
+const PLACE_CACHE_MAX = 500;
+
 function badRequest(res, message, detail) {
   return res.status(400).json({ error: "BAD_REQUEST", message, detail });
+}
+
+function buildPlaceQuery(order) {
+  const s = order?.shipping_address || {};
+  return [s.address1, s.city, s.province, s.zip, s.country]
+    .filter(Boolean)
+    .join(" ");
+}
+
+function getPlaceCache(key) {
+  const entry = placeResolveCache.get(key);
+  if (!entry) return null;
+  if (entry.expiresAt <= Date.now()) {
+    placeResolveCache.delete(key);
+    return null;
+  }
+  return entry.value;
+}
+
+function setPlaceCache(key, value) {
+  if (placeResolveCache.size >= PLACE_CACHE_MAX) {
+    const oldestKey = placeResolveCache.keys().next().value;
+    if (oldestKey) placeResolveCache.delete(oldestKey);
+  }
+  placeResolveCache.set(key, { value, expiresAt: Date.now() + PLACE_CACHE_TTL_MS });
 }
 
 function requireShopifyConfigured(res) {
@@ -420,11 +449,25 @@ app.post("/shopify/fulfill", async (req, res) => {
       });
     }
 
-    const fo =
-      fulfillmentOrders.find((f) => f.status !== "closed" && f.status !== "cancelled") ||
-      fulfillmentOrders[0];
+    if (fulfillmentOrders.every((f) => f.status === "closed")) {
+      return res.status(409).json({
+        error: "ORDER_ALREADY_FULFILLED",
+        message: "All fulfillment orders are closed"
+      });
+    }
 
-    const fulfillment_order_id = fo.id;
+    const line_items_by_fulfillment_order = fulfillmentOrders
+      .filter((fo) => fo.status !== "closed" && fo.status !== "cancelled")
+      .map((fo) => ({
+        fulfillment_order_id: fo.id,
+        fulfillment_order_line_items: (fo.line_items || [])
+          .filter((li) => li.remaining_quantity > 0)
+          .map((li) => ({
+            id: li.id,
+            quantity: li.remaining_quantity
+          }))
+      }))
+      .filter((entry) => entry.fulfillment_order_line_items.length > 0);
 
     const fulfillUrl = `${base}/fulfillments.json`;
     const fulfillmentPayload = {
@@ -436,7 +479,7 @@ app.post("/shopify/fulfill", async (req, res) => {
           url: trackingUrl || undefined,
           company: trackingCompanyFinal
         },
-        line_items_by_fulfillment_order: [{ fulfillment_order_id }]
+        line_items_by_fulfillment_order
       }
     };
 
@@ -467,6 +510,79 @@ app.post("/shopify/fulfill", async (req, res) => {
     console.error("Shopify fulfill error:", err);
     return res.status(502).json({
       error: "UPSTREAM_ERROR",
+      message: String(err?.message || err)
+    });
+  }
+});
+
+// ===== ParcelPerfect: resolve place code (PP search -> customer metafield -> none) =====
+app.post("/pp/resolve-place", async (req, res) => {
+  try {
+    const { order, customerPlaceCode } = req.body || {};
+    if (!order) return res.status(400).json({ error: "MISSING_ORDER" });
+
+    const query = buildPlaceQuery(order);
+    const cacheKey = `${query.toLowerCase()}|${String(customerPlaceCode || "")}`;
+    const cached = getPlaceCache(cacheKey);
+    if (cached) return res.json(cached);
+
+    if (!PP_BASE_URL || !PP_BASE_URL.startsWith("http")) {
+      return res.status(500).json({
+        error: "CONFIG_ERROR",
+        message: "PP_BASE_URL is not a valid URL"
+      });
+    }
+
+    if (!PP_TOKEN) {
+      return res.status(500).json({
+        error: "CONFIG_ERROR",
+        message: "PP_TOKEN is required for getPlace"
+      });
+    }
+
+    if (query) {
+      const paramsObj = {
+        id: PP_PLACE_ID || "ShopifyScanStation",
+        accnum: PP_ACCNUM || "",
+        ppcust: ""
+      };
+
+      const qs = new URLSearchParams();
+      qs.set("Class", "Waybill");
+      qs.set("method", "getPlace");
+      qs.set("token_id", PP_TOKEN);
+      qs.set("params", JSON.stringify(paramsObj));
+      qs.set("query", query);
+
+      const base = PP_BASE_URL.endsWith("/") ? PP_BASE_URL : PP_BASE_URL + "/";
+      const url = `${base}?${qs.toString()}`;
+
+      const upstream = await fetch(url, { method: "GET" });
+      const text = await upstream.text();
+      const data = JSON.parse(text);
+
+      const hit = Array.isArray(data?.results) ? data.results[0] : null;
+      const placeCode = hit?.placecode ?? hit?.place ?? null;
+      if (placeCode != null) {
+        const payload = { source: "pp", placeCode, hit };
+        setPlaceCache(cacheKey, payload);
+        return res.json(payload);
+      }
+    }
+
+    if (customerPlaceCode) {
+      const payload = { source: "customer_metafield", placeCode: customerPlaceCode };
+      setPlaceCache(cacheKey, payload);
+      return res.json(payload);
+    }
+
+    const payload = { source: "none", placeCode: null };
+    setPlaceCache(cacheKey, payload);
+    return res.json(payload);
+  } catch (err) {
+    console.error("PP resolve-place error:", err);
+    return res.status(502).json({
+      error: "PP_LOOKUP_FAILED",
       message: String(err?.message || err)
     });
   }
